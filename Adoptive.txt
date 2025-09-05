@@ -1,0 +1,481 @@
+Step 2 — Continuous Integration: Build → Test → Package → Publish (CI)
+
+Goal: turn the pushed commit into reproducible, validated artifacts (per-OS), produce metadata used later for risk scoring, and publish candidate artifacts to Artifactory.
+
+1) Trigger & Gate
+
+1.1. Ensure GitHub webhook triggers the CI pipeline (multibranch or PR job) when a push or PR occurs.
+1.2. Preferred flow: require PRs for changes to protected branches. If direct pushes to main are allowed, require the same CI checks to pass before any downstream promotion.
+Owner: Platform/CI team
+
+Deliverable: CI job triggered and PR protection rules in GitHub.
+
+2) Checkout & Source Validation
+
+2.1. Checkout the exact commit + submodule state. Record commit SHA, branch, author, PR id.
+2.2. Run lightweight pre-checks:
+
+Code formatting/linting (fail PR if formatting issues).
+
+Static analysis smoke (cppcheck/clang-tidy summary).
+
+Validate required telemetry/telemetry contract presence (if applicable).
+Owner: Repo owner + CI team
+
+Deliverable: pre-check report attached to the build.
+
+3) Choose Build Matrix (per OS / target)
+
+3.1. Determine target platforms for this repo from repo metadata (e.g., supports: arm, linux, windows).
+3.2. Provision or select Jenkins agents for each OS:
+
+ARM: use native ARM runners or cross-compile on Linux agent with validated cross toolchain.
+
+Linux: standard build node/container.
+
+Windows: Windows build agents (MSVC toolchain).
+3.3. Plan to run the OS builds in parallel (independent stages).
+Owner: CI + Platform
+
+Deliverable: build matrix manifest for the commit.
+
+4) Build & Reproducibility
+
+4.1. For each platform stage:
+
+Fetch locked toolchain versions (compiler, linker flags).
+
+Build with deterministic flags where possible.
+
+Produce binaries/images named using pattern: <service>-<platform>-<commit>-<buildId>.
+4.2. Compute artifacts checksum (SHA256) and capture the build environment metadata.
+Owner: Repo owners / CI
+
+Deliverable: artifacts and checksums for each platform.
+
+5) Tests & Quality Gates
+
+5.1. Unit tests: run unit suites per platform (gtest, etc.). Fail stage on critical test failures.
+5.2. Integration smoke tests: where possible run hardware-in-the-loop or emulator-based smoke tests for firmware/driver. If hardware unavailable, run simulated tests.
+5.3. Coverage: produce coverage report (if enabled) and record coverage delta vs baseline.
+5.4. Static/security scans: run static analysers and dependency vulnerability scans (SBOM). Block on critical findings.
+Owner: QA + Security + Repo owners
+
+Deliverable: test report, coverage numbers, static & security scan summary.
+
+6) SBOM & Dependency Snapshot
+
+6.1. Generate SBOM / dependency manifest for the build (Syft or equivalent).
+6.2. Record changed dependency list (new/updated packages) to feed risk scoring.
+Owner: CI & Security
+
+Deliverable: sbom.json, deps_changed.json.
+
+7) Build Metadata & Risk Inputs
+
+7.1. Produce a single build-info JSON per build that includes:
+
+commit SHA, build ID, repo, branch, author
+
+platforms built
+
+checksums, file paths in Artifactory
+
+unit/integration test results and coverage delta
+
+SBOM path and security scan summary
+
+files changed (git diff list), LOC changed
+
+historical flags (e.g., module’s past failure rate — fetched from CI history)
+7.2. Store risk-inputs.json alongside the artifact for later policy/risk scoring stages.
+Owner: CI team
+
+Deliverable: build-info.json and risk-inputs.json.
+
+8) Publish Candidate Artifacts to Artifactory
+
+8.1. Publish each platform artifact to a candidate namespace, e.g.:
+artifactory/candidates/<service>/<buildId>/<platform>/
+8.2. Attach build-info.json, sbom.json, test reports, and checksum files to the artifact version. Mark metadata field state=candidate (don’t set latest yet).
+Owner: CI + Artifactory admins
+
+Deliverable: candidate artifacts with attached metadata.
+
+9) Cross-Repo Integration (if multiple repos form a bundle)
+
+9.1. If driver + firmware + user-space must be combined, trigger an integration job:
+
+Resolve compatible artifact versions from Artifactory.
+
+Assemble bundle manifest that lists each artifact and checksums.
+
+Run integration smoke test harness in an isolated Green-like environment (not production Blue).
+9.2. Publish an integration bundle artifact: candidates/<bundle>/<buildId>/manifest.json.
+Owner: Release manager / Integration team
+
+Deliverable: integration bundle + integration test report.
+
+10) Initial Notifications & Dashboarding
+
+10.1. Post CI build outcome to team channels (Slack) with links to:
+
+build logs
+
+artifact in Artifactory
+
+build-info metadata
+
+quick test summary and next steps (integration, manual QA).
+10.2. Record this build in Release/CI dashboard for visibility.
+Owner: CI / Dev teams
+
+Deliverable: notification message + dashboard entry.
+
+11) Gates & Failure Handling
+
+11.1. If any mandatory gate fails (unit tests, static/security critical), mark the build rejected and:
+
+Post failure details to PR.
+
+Prevent merge or promotion of artifact.
+11.2. If non-blocking issues (minor warnings), mark needs-attention and allow integration to proceed depending on policy.
+Owner: Repo owners + CI
+
+Deliverable: gate verdict and PR comments.
+
+12) Deliverables from Step 2 (Summary)
+
+Per-platform artifacts (binaries, firmware images) with checksums in Artifactory (candidate namespace).
+
+build-info.json and risk-inputs.json attached to each candidate.
+
+SBOM and security scan results.
+
+Unit/integration/test reports and coverage delta.
+
+Integration bundle (if applicable) with manifest.
+
+Notification posted to Slack + dashboard entry.
+
+13) Validation Checklist (what to verify before proceeding to Step 3)
+
+
+
+Step 3 — Risk Scoring → Strategy Selection (Procedure)
+
+Goal: convert the build-info/artifact data (from Step 2) into a single risk_score (0–100) and a deploy_strategy (rolling | canary | blue-green) + pace_schedule. This decision must be auditable, versioned, and testable in shadow mode before enforcement.
+
+Owners:
+
+Platform/CI (implement pipeline step)
+
+SRE/Release (policy & runbooks)
+
+Service owners (SLOs, criticality labels)
+
+Security (vuln gating)
+
+Deliverables:
+
+risk-inputs.json (already produced in Step 2)
+
+risk-decision.json (output of this step)
+
+Policy file(s) (versioned) and policy registry entry
+
+Evidence attached to artifact in Artifactory (decision + reasoning)
+
+A. Gather & normalize inputs (what to collect now)
+
+Action steps (do these immediately inside the pipeline after publishing artifact):
+
+Collect build-info.json / risk-inputs.json from Artifactory for the build. Ensure it contains:
+
+commit SHA, buildId, repo, branch, author
+
+per-platform artifacts and checksums
+
+unit/integration test results (counts: failed, flaky)
+
+coverage delta vs baseline
+
+SBOM / dependency changes (new/updated libs)
+
+static/security scan summary (critical/high/medium CVEs)
+
+files changed list and LOC changed
+
+historical failure rate for the module (from CI history)
+
+environment targets (arm/linux/windows)
+
+if available: results of hardware-in-loop or emulator tests
+
+Augment with runtime/context signals:
+
+current production traffic level / QPS
+
+calendar context (is it peak business window / maintenance window)
+
+service criticality tag (payment/auth are high-criticality)
+
+previous successful release time and last rollback flag
+
+Deliverable: single normalized risk-inputs-for-decision.json.
+
+B. Decide scoring approach (Phase 1: heuristic, Phase 2: ML)
+
+Choose a safe, incremental path:
+
+Phase 1 — Heuristic (ship fast): deterministic weighted formula that yields risk_score. Use heuristics for immediate rollout, useful for shadow/drift data collection.
+
+Phase 2 — ML (after history): train a supervised model (XGBoost/LightGBM) that predicts P(failure | change). Use the heuristic as a fallback and/or as a feature.
+
+Procedure now: implement the heuristic first, collect labeled outcome data, then iterate to ML.
+
+C. Heuristic scoring: concrete procedure & sample formula
+
+Action steps:
+
+Define features and weights (example; tune later):
+
+w_loc = weight for LOC changed
+
+w_files = weight for files changed count
+
+w_dep = weight if dependencies bumped (0/1)
+
+w_coverage = negative weight for coverage gain (reduces risk)
+
+w_unitfail = weight per failing unit test
+
+w_integfail = large weight for integration test failures
+
+w_security = large weight for critical CVEs
+
+w_pastfail = weight for module past failure rate
+
+w_hardware = extra penalty for firmware/kernel/driver changes (ARM, kernel modules)
+
+w_criticality = multiply factor if service is high-critical
+
+Compute raw score:
+
+Example method: raw = a1*(LOC/100) + a2*(files/10) + a3*(deps_changed?1:0) + a4*(failed_unit_tests) + a5*(integration_fail?10:0) + a6*(critical_vuln?50:0) + ...
+
+Normalize and clamp into 0–100.
+
+Apply modifiers:
+
+Multiply by criticality_factor (1.0 normal, 1.5 for critical services).
+
+Add platform_penalty for firmware/driver builds (e.g., +15) because device updates are riskier.
+
+Reduce score if build has very high test coverage gain.
+
+Produce final risk_score (0–100) and simple reasoning list (which features contributed most).
+
+Deliverable: risk-decision.json containing { risk_score, top_contributors[], recommended_strategy, suggested_pace }.
+
+Note: keep the exact numeric coefficients in a versioned policy file so they are auditable and tunable.
+
+D. Strategy mapping — how to pick Rolling / Canary / Blue-Green
+
+Procedure (policy-based mapping):
+
+Define strategy buckets (example; calibrate with historical data):
+
+0–30 → Rolling (fast; larger batch sizes)
+
+31–70 → Canary (progressive: 10% → 25% → 50% → 100%)
+
+71–100 → Blue-Green (full staged environment; manual approval optional)
+
+Parameterize pace schedules per bucket:
+
+Rolling: batch size = 50–100% per step, can be fast
+
+Canary: weights = [10, 25, 50, 100]; windows = [2m, 5m, 10m, 15m] (example)
+
+Blue-Green: deploy to Green; require N consecutive healthy windows (e.g., 3 x 2m) before cutover
+
+Add special overrides:
+
+If security_critical (critical CVE) → force Blue-Green regardless of score.
+
+If db_schema_change or kernel/driver change → require Blue-Green + manual approval.
+
+For hotfix labeled by team → treat as high-urgency; allow manual override but require smaller canary and closer monitoring.
+
+Per-OS adjustments:
+
+Firmware/ARM: be more conservative (increment mapping thresholds by +10–15). Prefer Blue-Green or small cohort canaries even for medium risk.
+
+Windows drivers: require driver signing & driver-specific tests; bump risk by +10 if signing new.
+
+Linux user-space: follow default mapping.
+
+Deliverable: strategy-mapping-policy.yaml (versioned).
+
+E. Parameterizing thresholds (how to pick numeric thresholds safely)
+
+Procedure to determine thresholds scientifically:
+
+Collect historical dataset (builds → outcomes):
+
+From Step 2 + Step 3 shadow runs, collect features and outcome label: success (no rollback / no SLO breach) vs failure (rollback / significant SLO breach).
+
+Minimum sample target: 200–500 labeled releases over time for a meaningful ML model; for threshold tuning you can start smaller with conservative margins.
+
+Backtest heuristics against history:
+
+Replay historical builds with the heuristic; record predicted bucket vs actual outcome and compute:
+
+True positive rate (predict failure & failure)
+
+False positive rate (predict failure & no failure)
+
+Cost metrics (how many unnecessary Blue-Green would have occurred)
+
+Choose thresholds that keep false positives acceptable (operator burden) while catching most failures.
+
+Define per-service tolerance:
+
+For high-critical services, set a lower tolerance for false negatives (catch more failures) — shift thresholds downward.
+
+For low-traffic or experimental services, allow higher tolerance.
+
+Set watch windows & consecutive window counts:
+
+Use historical window size where anomalies were visible (empirically). Typical start: 2m windows and require 3 consecutive healthy windows before promotion.
+
+Tune these based on false positives/negatives in shadow.
+
+Governance sign-off:
+
+Present proposed thresholds and historical backtest summary to SRE + Engineering leadership for approval before enforcement.
+
+Deliverable: thresholds-and-windows.md with per-service overrides.
+
+F. Policy storage, versioning & retrieval (where to store policy)
+
+Procedure:
+
+Policy-as-code repository (Git)
+
+Store all policy artifacts in a dedicated repo (e.g., infra/policies/deploy-strategy/), versioned with PR review.
+
+Files to keep: risk-weights.yaml, strategy-mapping-policy.yaml, thresholds-and-windows.yaml, policy-metadata.md.
+
+Require SRE + Security review for changes; use branch protections and signed commits.
+
+Policy Registry (runtime)
+
+Option A (simple): Jenkins pulls these YAML files from Git at pipeline start (cache with TTL).
+
+Option B (advanced): host a small Policy Service (HTTP) that returns the active policy bundle (with version id). Pipeline queries it to decide.
+
+Record the policy version id used in risk-decision.json and attach to Artifactory build metadata.
+
+Model artifacts (if ML)
+
+Store trained models in MLflow or an artifact store. Keep model registry entries with version, metrics, training data snapshot and approval state.
+
+Policy bundle must reference model version if used.
+
+Audit Trail
+
+Every decision must store: policy version, model version (if any), risk inputs, computed score, final strategy & pace, who/what triggered the decision (automation id), and time.
+
+Persist this in Artifactory as build property or in a decisions DB.
+
+Deliverable: policy Git repo, runtime policy retrieval contract, decision-audit storage pattern.
+
+G. Integration into Jenkins pipeline (where to put this step)
+
+Procedure (stages / actions):
+
+Add a Decide Strategy stage immediately after artifact publish:
+
+Stage collects risk-inputs.json.
+
+Stage fetches current policy from Git/Policy Service.
+
+Stage runs the heuristic OR calls the model service.
+
+Stage emits risk-decision.json (risk_score, strategy, pace, contributors, policy_version).
+
+Stage records the decision in Artifactory build-info and posts a concise message to Slack.
+
+Branch to strategy-specific deployment stages:
+
+If rolling: run Rolling Deploy stage with configured batch size.
+
+If canary: run Canary Deploy stage with configured weights & analyzer gates.
+
+If blue-green: run Deploy to Green → Validate Green → Cutover stages.
+
+Add manual approval gates for high-risk:
+
+If risk_score >= manual_approval_threshold (e.g., 85), require explicit human approval in pipeline before proceeding with Blue-Green cutover.
+
+Deliverable: Decide Strategy stage added and linked to subsequent stages.
+
+H. Shadowing, calibration & promoting to enforcement
+
+Procedure:
+
+Shadow mode: run the Decide Strategy logic in shadow for N releases (N≥10–20), emit decisions but do not alter deployment behavior. Log counterfactual results (what would have happened vs actual outcome).
+
+Calibration: review shadow logs weekly:
+
+Evaluate false positive / false negative counts.
+
+Adjust weights, thresholds, or ML hyperparameters.
+
+Re-run shadow until acceptable metrics.
+
+Canary enforcement: enable decision-driven deployment for a small subset of services or repositories first (canary within canary): allow automation to act only for non-critical services initially.
+
+Full enforcement: after confidence and governance sign-off, enable for all services. Continue monitoring and periodic retraining/recalibration.
+
+Deliverable: shadow run reports and decision to enable enforcement.
+
+I. ML Path (when you have labeled history)
+
+If you decide to move to ML:
+
+Features to store (from Step 2/3):
+
+LOC changed, files changed, tests failed counts, integration failures, coverage delta, dep bump flag, critical CVE count, past failure rate, platform tag, author/repo historical reliability metrics, time-of-day, test flakiness index.
+
+Label definition:
+
+1 = release required rollback within X hours OR caused >SLO breach requiring revert/fix.
+
+0 = stable release (no rollback and SLOs OK for Y hours).
+
+Train/eval:
+
+Use cross-validation and report AUC, precision@K, calibration. Select model that minimizes false negatives for critical services (higher recall) while keeping false positives within operator tolerance.
+
+Deploy model in shadow first, then in production via model registry. Always include fallback to heuristic (e.g., if model unavailable).
+
+Deliverable: model registry entry, evaluation report, model version in policy bundle.
+
+J. Validation & Success Criteria for Step 3
+
+risk-decision.json is generated and attached to every candidate artifact.
+
+Policy version used is recorded and auditable.
+
+Shadow run false positive rate < agreed threshold (e.g., 10%) before enforcement.
+
+Manual-approval threshold enforced for high-risk changes.
+
+Per-OS exceptions (firmware/driver) are respected (higher safety bias).
+
+After rollout, decision accuracy (over 3 months) meets governance SLA (catch X% of rollbacks before they hit production).
+
+K. Immediate actions you can run today (short checklist)
